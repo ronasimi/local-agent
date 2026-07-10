@@ -14,7 +14,7 @@ from prompt_toolkit.completion import WordCompleter
 
 # Configuration
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-MODEL_NAME = "qwen2.5"
+MODEL_NAME = "qwen2.5:7b-instruct-q4_K_M"
 MEMORY_FILE = "/app/memory/chat_history.json"
 CMD_HISTORY_FILE = "/app/memory/cmd_history.txt"
 WORKSPACE_DIR = "/app/workspace"
@@ -228,7 +228,7 @@ def execute_react_loop(messages, verbose=False):
             model=MODEL_NAME, 
             messages=messages,
             options={
-                "num_ctx": 8192,
+                "num_ctx": 16384,
                 "stop": [
                     "Observation:", 
                     "\nObservation:"
