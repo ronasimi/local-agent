@@ -3,6 +3,7 @@ import json
 import sys
 import re
 import requests
+import base64
 from datetime import datetime
 from ollama import Client
 from ddgs import DDGS
@@ -19,6 +20,12 @@ CMD_HISTORY_FILE = "/app/memory/cmd_history.txt"
 WORKSPACE_DIR = "/app/workspace"
 
 client = Client(host=OLLAMA_HOST)
+
+def copy_to_clipboard(text: str):
+    """Uses ANSI OSC 52 escape sequence to copy text to the host clipboard from inside Docker."""
+    encoded = base64.b64encode(text.encode('utf-8')).decode('utf-8')
+    sys.stdout.write(f"\033]52;c;{encoded}\a")
+    sys.stdout.flush()
 
 # Tool Definitions
 def search_ddg(query: str) -> str:
@@ -51,7 +58,6 @@ def search_imdb(query: str) -> str:
 def get_weather(location: str) -> str:
     """Get the current live weather conditions for a specific city or location."""
     try:
-        # Custom format to return text instead of just emojis
         custom_format = "%l:+%C+(%c),+%t"
         response = requests.get(f"https://wttr.in/{location}?format={custom_format}", timeout=5)
         if response.status_code == 200:
@@ -78,8 +84,6 @@ def write_file(filename_and_content: str) -> str:
     """Writes content to a local file in the workspace."""
     try:
         filename, content = filename_and_content.split('|', 1)
-        
-        # Clean up accidental "filename=" prefix
         safe_filename = filename.replace("filename=", "").strip()
         safe_filename = os.path.basename(safe_filename)
         filepath = os.path.join(WORKSPACE_DIR, safe_filename)
@@ -96,7 +100,6 @@ def write_file(filename_and_content: str) -> str:
 def read_system_proc(filepath: str) -> str:
     """Reads read-only system information from the host /proc directory."""
     HOST_PROC_DIR = "/host_proc"
-    
     clean_path = filepath.lstrip('/')
     full_path = os.path.abspath(os.path.join(HOST_PROC_DIR, clean_path))
     
@@ -126,7 +129,6 @@ tools_map = {
     'get_system_time': get_system_time
 }
 
-# Inject the live date when the script runs
 current_time = datetime.now().strftime("%A, %B %d, %Y %I:%M %p")
 
 REACT_SYSTEM_PROMPT = f"""
@@ -147,18 +149,22 @@ SYSTEM AWARENESS: The current date and time is {current_time}.
 - read_system_proc: Read hardware and system info from the host OS. YOU MUST USE THIS TOOL if the user asks about "your" memory, RAM, CPU, or system specs. Common inputs: 'cpuinfo', 'meminfo', 'uptime', 'version'. 💻
 - get_system_time: Use this to check the current date, time, or year. 🕒
 
-⚙️  STRICT OUTPUT FORMAT:
-You MUST format your output exactly like this:
+⚙️  OUTPUT FORMAT (TWO PATHS):
 
+PATH 1: CASUAL CHAT (FAST-TRACK)
+If the user is just saying hello, thanking you, or asking a casual question that requires NO tools, completely skip the Thought and Action steps. 
+Immediately output:
+Final Answer: your conversational response.
+⚠️ CRITICAL: DO NOT use this path if the user asks for LIVE or FACTUAL data (like weather, system stats, current time, news, or search). You have no internal knowledge of the present. For those, you MUST use PATH 2.
+
+PATH 2: TOOL USE REQUIRED
+If you need to look up information, read/write files, or check the system, you MUST use the strict ReAct format:
 Thought: your internal reasoning about what to do next
 Action: the exact tool name (e.g., read_system_proc)
 Action Input: the query to pass to the tool
 
 (You will then receive an Observation from the system, and you can repeat this cycle 🔄)
-
-🏁  FINAL RESOLUTION:
-When you have enough information to answer the user, output:
-
+When you have the information, conclude with:
 Thought: I now have the final answer. 💡
 Final Answer: your response to the user.
 
@@ -167,15 +173,8 @@ Final Answer: your response to the user.
 - NEVER output a "Final Answer" in the same step as an "Action". After writing the Action Input, you must STOP! ⚠️
 - NEVER use placeholders like [Insert Data Here]. If you do not know the information, you MUST use a tool to find it before taking any other action.
 - TOOL CHAINING: If you are asked to save live data to a file, you must first use a tool (like get_weather) to gather the data, wait for the Observation, and THEN use the write_file tool in your next step.
-
-📝 EXAMPLE OF A PERFECT TURN:
-User: How much memory are you using?
-Thought: The user is asking about my system memory. I must use the read_system_proc tool with the 'meminfo' input.
-Action: read_system_proc
-Action Input: meminfo
 """
 
-# History Management
 def load_memory():
     if os.path.exists(MEMORY_FILE):
         try:
@@ -195,6 +194,7 @@ def parse_react_output(text):
     action_match = re.search(r"Action:\s*(.*)", text)
     input_match = re.search(r"Action Input:\s*(.*)", text)
     
+    # 1. Did it successfully call a tool?
     if action_match and input_match:
         return {
             "type": "action",
@@ -202,10 +202,19 @@ def parse_react_output(text):
             "input": input_match.group(1).strip()
         }
         
+    # 2. Did it explicitly declare a final answer?
     if "Final Answer:" in text:
         return {"type": "finish", "content": text.split("Final Answer:")[-1].strip()}
         
-    return {"type": "invalid", "content": text.strip()}
+    # 3. Fast-Track Conversational Fallback
+    # If it attempted to use a tool but broke syntax, throw an error.
+    if "Action:" in text or "Action Input:" in text:
+        return {"type": "invalid", "content": text.strip()}
+        
+    # If no tool words are present, assume it's a fast-tracked conversational response.
+    # We strip out stray "Thought:" tags just in case it thought for a second before answering.
+    clean_text = text.replace("Thought:", "").strip()
+    return {"type": "finish", "content": clean_text}
 
 def execute_react_loop(messages, verbose=False):
     max_steps = 5
@@ -303,6 +312,7 @@ def main():
     print("⌨️  COMMANDS:")
     print("  • /think           : Toggle verbose internal monologue 🧠")
     print("  • /wipe            : Clear chat memory and start fresh 🧹")
+    print("  • /copy            : Copy the last agent response to clipboard 📋")
     print("  • exit / quit      : End the session and save history 🛑")
     print("=========================================================\n")
 
@@ -311,15 +321,15 @@ def main():
         try: os.remove(bad_file)
         except Exception: pass
 
-    # --- Set up Autocomplete and History ---
     os.makedirs(os.path.dirname(CMD_HISTORY_FILE), exist_ok=True)
     
-    autocomplete_words = ['/think', '/wipe', 'exit', 'quit'] + list(tools_map.keys())
+    autocomplete_words = ['/think', '/wipe', '/copy', 'exit', 'quit'] + list(tools_map.keys())
     completer = WordCompleter(autocomplete_words, ignore_case=True)
     
     session = PromptSession(history=FileHistory(CMD_HISTORY_FILE))
 
     first_prompt = True
+    last_agent_response = ""
 
     while True:
         try:
@@ -348,10 +358,19 @@ def main():
                 save_memory(messages)
                 print("🧹 Memory wiped. Context reset!")
                 continue
+
+            if user_input.lower() == '/copy':
+                if last_agent_response:
+                    copy_to_clipboard(last_agent_response)
+                    print("📋 Copied last response to host clipboard!")
+                else:
+                    print("⚠️ Nothing to copy yet.")
+                continue
             
             messages.append({"role": "user", "content": user_input})
             
             final_response, messages = execute_react_loop(messages, verbose=verbose_mode)
+            last_agent_response = final_response
             
             print(f"💻: {final_response}")
             
