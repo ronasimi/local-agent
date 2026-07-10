@@ -7,11 +7,15 @@ from datetime import datetime
 from ollama import Client
 from ddgs import DDGS
 import wikipedia
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.completion import WordCompleter
 
 # Configuration
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 MODEL_NAME = "qwen2.5-coder:7b"
 MEMORY_FILE = "/app/memory/chat_history.json"
+CMD_HISTORY_FILE = "/app/memory/cmd_history.txt"
 WORKSPACE_DIR = "/app/workspace"
 
 client = Client(host=OLLAMA_HOST)
@@ -47,8 +51,7 @@ def search_imdb(query: str) -> str:
 def get_weather(location: str) -> str:
     """Get the current live weather conditions for a specific city or location."""
     try:
-        # Changed format from '3' to a custom string that returns explicit text
-        # %l = location, %C = textual condition, %c = emoji, %t = temperature
+        # Custom format to return text instead of just emojis
         custom_format = "%l:+%C+(%c),+%t"
         response = requests.get(f"https://wttr.in/{location}?format={custom_format}", timeout=5)
         if response.status_code == 200:
@@ -212,7 +215,6 @@ def execute_react_loop(messages, verbose=False):
             sys.stdout.write(f"\r\033[K💭 Thinking (Step {step+1})... ")
             sys.stdout.flush()
 
-        # Added options to strictly limit context size and fix stop words
         response = client.chat(
             model=MODEL_NAME, 
             messages=messages,
@@ -300,6 +302,7 @@ def main():
     print("  • get_system_time  : Check the current date, time, or year 🕒\n")
     print("⌨️  COMMANDS:")
     print("  • /think           : Toggle verbose internal monologue 🧠")
+    print("  • /wipe            : Clear chat memory and start fresh 🧹")
     print("  • exit / quit      : End the session and save history 🛑")
     print("=========================================================\n")
 
@@ -308,15 +311,23 @@ def main():
         try: os.remove(bad_file)
         except Exception: pass
 
+    # --- Set up Autocomplete and History ---
+    os.makedirs(os.path.dirname(CMD_HISTORY_FILE), exist_ok=True)
+    
+    autocomplete_words = ['/think', '/wipe', 'exit', 'quit'] + list(tools_map.keys())
+    completer = WordCompleter(autocomplete_words, ignore_case=True)
+    
+    session = PromptSession(history=FileHistory(CMD_HISTORY_FILE))
+
     first_prompt = True
 
     while True:
         try:
             if first_prompt:
-                user_input = input("👤: ").strip()
+                user_input = session.prompt("👤: ", completer=completer).strip()
                 first_prompt = False
             else:
-                user_input = input("\n👤: ").strip()
+                user_input = session.prompt("\n👤: ", completer=completer).strip()
                 
             if not user_input:
                 continue
@@ -330,6 +341,12 @@ def main():
                 verbose_mode = not verbose_mode
                 status = "ON" if verbose_mode else "OFF"
                 print(f"🔧 Verbose thinking mode turned {status}.")
+                continue
+                
+            if user_input.lower() == '/wipe':
+                messages = [{"role": "system", "content": REACT_SYSTEM_PROMPT}]
+                save_memory(messages)
+                print("🧹 Memory wiped. Context reset!")
                 continue
             
             messages.append({"role": "user", "content": user_input})
