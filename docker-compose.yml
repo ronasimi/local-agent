@@ -20,6 +20,7 @@ services:
     container_name: terminal_agent
     depends_on:
       - ollama
+    pid: "host"
     environment:
       - OLLAMA_HOST=http://ollama:11434
       - TZ=America/Toronto
@@ -27,5 +28,6 @@ services:
       - ./memory:/app/memory
       - ./workspace:/app/workspace
       - /proc:/host_proc:ro
+      - /var/run/docker.sock:/var/run/docker.sock
     stdin_open: true
     tty: true

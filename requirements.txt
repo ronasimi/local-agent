@@ -3,3 +3,9 @@ ddgs
 wikipedia
 requests
 prompt_toolkit
+docker
+beautifulsoup4
+lxml
+psutil
+pymysql
+chromadb
