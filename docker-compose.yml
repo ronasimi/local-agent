@@ -6,6 +6,13 @@ services:
       - "11434:11434"
     volumes:
       - ./ollama_data:/root/.ollama
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    environment:
+      - OLLAMA_CONTEXT_LENGTH=8192
+      - OLLAMA_VULKAN=1
+      - OLLAMA_IGPU_ENABLE=1
     restart: always
 
   agent:
@@ -15,6 +22,7 @@ services:
       - ollama
     environment:
       - OLLAMA_HOST=http://ollama:11434
+      - TZ=America/Toronto
     volumes:
       - ./memory:/app/memory
       - ./workspace:/app/workspace

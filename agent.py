@@ -3,13 +3,14 @@ import json
 import sys
 import re
 import requests
+from datetime import datetime
 from ollama import Client
 from ddgs import DDGS
 import wikipedia
 
 # Configuration
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-MODEL_NAME = "qwen2.5:3b"
+MODEL_NAME = "qwen2.5-coder:7b"
 MEMORY_FILE = "/app/memory/chat_history.json"
 WORKSPACE_DIR = "/app/workspace"
 
@@ -46,7 +47,10 @@ def search_imdb(query: str) -> str:
 def get_weather(location: str) -> str:
     """Get the current live weather conditions for a specific city or location."""
     try:
-        response = requests.get(f"https://wttr.in/{location}?format=3", timeout=5)
+        # Changed format from '3' to a custom string that returns explicit text
+        # %l = location, %C = textual condition, %c = emoji, %t = temperature
+        custom_format = "%l:+%C+(%c),+%t"
+        response = requests.get(f"https://wttr.in/{location}?format={custom_format}", timeout=5)
         if response.status_code == 200:
             return response.text.strip()
         return f"Weather service returned status code {response.status_code}."
@@ -104,6 +108,10 @@ def read_system_proc(filepath: str) -> str:
     except Exception as e:
         return f"Error reading system file: {str(e)}"
 
+def get_system_time(query: str = "") -> str:
+    """Returns the current date and time of the host system."""
+    return f"The current system date and time is {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}."
+
 tools_map = {
     'search_ddg': search_ddg,
     'search_wikipedia': search_wikipedia,
@@ -111,15 +119,20 @@ tools_map = {
     'get_weather': get_weather,
     'read_file': read_file,
     'write_file': write_file,
-    'read_system_proc': read_system_proc
+    'read_system_proc': read_system_proc,
+    'get_system_time': get_system_time
 }
 
-REACT_SYSTEM_PROMPT = """
+# Inject the live date when the script runs
+current_time = datetime.now().strftime("%A, %B %d, %Y %I:%M %p")
+
+REACT_SYSTEM_PROMPT = f"""
 🌟 ========================================= 🌟
      🤖 AUTONOMOUS REACT AGENT PROTOCOL 🤖
 🌟 ========================================= 🌟
 
 You are an autonomous AI agent operating on the ReAct (Reason + Act) framework. 🧠✨
+SYSTEM AWARENESS: The current date and time is {current_time}.
 
 🛠️  AVAILABLE TOOLS:
 - search_ddg: Search the live internet for recent news, events, or general web searches. 🌐
@@ -129,6 +142,7 @@ You are an autonomous AI agent operating on the ReAct (Reason + Act) framework. 
 - read_file: Read the text contents of a file in your workspace. 📄
 - write_file: Write text to a file in your workspace. The Action Input MUST be formatted exactly as 'filename.txt|Your content here'. ✍️
 - read_system_proc: Read hardware and system info from the host OS. YOU MUST USE THIS TOOL if the user asks about "your" memory, RAM, CPU, or system specs. Common inputs: 'cpuinfo', 'meminfo', 'uptime', 'version'. 💻
+- get_system_time: Use this to check the current date, time, or year. 🕒
 
 ⚙️  STRICT OUTPUT FORMAT:
 You MUST format your output exactly like this:
@@ -188,7 +202,6 @@ def parse_react_output(text):
     if "Final Answer:" in text:
         return {"type": "finish", "content": text.split("Final Answer:")[-1].strip()}
         
-    # Mark incomplete format so the loop can repair it
     return {"type": "invalid", "content": text.strip()}
 
 def execute_react_loop(messages, verbose=False):
@@ -199,15 +212,15 @@ def execute_react_loop(messages, verbose=False):
             sys.stdout.write(f"\r\033[K💭 Thinking (Step {step+1})... ")
             sys.stdout.flush()
 
+        # Added options to strictly limit context size and fix stop words
         response = client.chat(
             model=MODEL_NAME, 
             messages=messages,
             options={
+                "num_ctx": 8192,
                 "stop": [
                     "Observation:", 
-                    "\nObservation:", 
-                    "\nThought:",     # Hard brake if it tries to jump ahead
-                    "\nAction:"       # Hard brake if it tries to chain prematurely
+                    "\nObservation:"
                 ]
             }
         )
@@ -228,7 +241,6 @@ def execute_react_loop(messages, verbose=False):
             return parsed["content"], messages
             
         elif parsed["type"] == "invalid":
-            # Nudge the model to finish its thought with an Action or Final Answer
             feedback = "System Notice: You provided a Thought but did not specify an Action or Final Answer. You must pick an explicit Action and Action Input from the available tools list to proceed."
             if verbose:
                 print(f"⚠️  Format Error caught. Sending correction feedback to model.")
@@ -284,13 +296,13 @@ def main():
     print("  • get_weather      : Find current weather conditions for a location 🌤️")
     print("  • read_file        : Read the text contents of a workspace file 📄")
     print("  • write_file       : Write text to a file in your workspace ✍️")
-    print("  • read_system_proc : Read hardware and system info from the host OS 💻\n")
+    print("  • read_system_proc : Read hardware and system info from the host OS 💻")
+    print("  • get_system_time  : Check the current date, time, or year 🕒\n")
     print("⌨️  COMMANDS:")
     print("  • /think           : Toggle verbose internal monologue 🧠")
     print("  • exit / quit      : End the session and save history 🛑")
     print("=========================================================\n")
 
-    # Clean up old broken filename if it exists in local directory from previous run
     bad_file = os.path.join(WORKSPACE_DIR, "filename=tokyo_weather.txt")
     if os.path.exists(bad_file):
         try: os.remove(bad_file)
