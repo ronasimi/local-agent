@@ -2,3 +2,6 @@
 memory/
 workspace/
 ollama_data/
+
+# Real credentials -- never commit this, only .env.example
+.env

@@ -1,692 +1,553 @@
-import os
-import json
-import sys
-import re
-import time
-import requests
-import base64
-import docker
-import glob
-import psutil
-import pymysql
-import chromadb
+import os, json, sys, time, requests, base64, docker, glob, psutil, pymysql, chromadb, re, hashlib
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 from datetime import datetime
+from dateutil.relativedelta import relativedelta
 from ollama import Client
 from ddgs import DDGS
-import wikipedia
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.completion import WordCompleter
 
-# Configuration
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-MODEL_NAME = "qwen2.5-coder:3b"
+# --- Configuration ---
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
+OLLAMA_CTX = int(os.getenv("OLLAMA_CONTEXT_LENGTH", "8192"))
+MODEL_NAME = "qwen2.5:7b-instruct"  # general instruct model: uses native hermes-style tool_calls reliably
+SUB_MODEL_NAME = "qwen2.5-coder:0.5b"     # stays tiny -- it only does narrow extraction/summarization
 
-# Memory Paths
 MEMORY_DIR = os.getenv("MEMORY_DIR", "/app/memory")
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/app/workspace")
 MEMORY_FILE = os.path.join(MEMORY_DIR, "chat_history.json")
 CMD_HISTORY_FILE = os.path.join(MEMORY_DIR, "cmd_history.txt")
 
+# --- Database Credentials ---
+# No hardcoded fallbacks: this tool stays disabled (see query_mariadb) until you set these explicitly.
+DB_HOST = os.getenv("DB_HOST")
+DB_USER = os.getenv("DB_USER")
+DB_PASS = os.getenv("DB_PASS")
+DB_NAME = os.getenv("DB_NAME")
+
 client = Client(host=OLLAMA_HOST)
 
-# --- Knowledge Base Setup ---
-CHROMA_PATH = os.path.join(MEMORY_DIR, "vector_db")
-os.makedirs(CHROMA_PATH, exist_ok=True)
+# --- Databases ---
+os.makedirs(CHROMA_PATH := os.path.join(MEMORY_DIR, "vector_db"), exist_ok=True)
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 kb_collection = chroma_client.get_or_create_collection(name="agent_knowledge")
+few_shot_collection = chroma_client.get_or_create_collection(name="agent_few_shot")
 
 def copy_to_clipboard(text: str):
-    """Uses ANSI OSC 52 escape sequence to copy text to the host clipboard from inside Docker."""
-    encoded = base64.b64encode(text.encode('utf-8')).decode('utf-8')
-    sys.stdout.write(f"\033]52;c;{encoded}\a")
+    """Copies text to the host clipboard via OSC 52 ANSI escape sequence."""
+    sys.stdout.write(f"\033]52;c;{base64.b64encode(text.encode()).decode()}\a")
     sys.stdout.flush()
 
-# --- Core Tools ---
+# ==========================================
+# 0.5B SUB-AGENT DELEGATION PROTOCOL
+# ==========================================
+
+def sub_agent_task(text: str, instruction: str) -> str:
+    """Passes messy or token-heavy text to the 0.5B model for extraction/summarization."""
+    if not text or "error" in text.lower() or len(text) < 200: 
+        return text 
+    try:
+        res = client.chat(model=SUB_MODEL_NAME, messages=[
+            {"role": "system", "content": f"You are a concise data-extraction sub-agent. {instruction} No fluff."},
+            {"role": "user", "content": text[:8000]}
+        ], options={"num_predict": 300, "temperature": 0.1})
+        return f"[0.5B Summary] {res.message.content.strip()}"
+    except Exception as e: 
+        return f"[Sub-agent error: {e}]\n<raw_text>\n{text[:500]}\n</raw_text>"
+
+# ==========================================
+# 🛠️ AGENT TOOLS (Auto-Parsed by Ollama SDK)
+# ==========================================
+
 def search_ddg(query: str) -> str:
+    """Search the live internet for up-to-date facts and news."""
     try:
         with DDGS() as ddgs:
-            results = [r for r in ddgs.text(query, max_results=3)]
-            if not results:
-                return "No web results found."
-            return "\n\n".join([f"Title: {r['title']}\nSnippet: {r['body']}" for r in results])
-    except Exception as e:
-        return f"DuckDuckGo search error: {str(e)}"
+            res = [f"Title: {r['title']}\nSnippet: {r['body']}" for r in ddgs.text(query, max_results=3)]
+            return "\n\n".join(res) if res else "No results found."
+    except Exception as e: return f"Search error: {e}"
 
-def search_wikipedia(query: str) -> str:
+def search_wikipedia(subject: str) -> str:
+    """Search Wikipedia for biographical, historical, and factual background."""
     try:
-        return wikipedia.summary(query, sentences=3)
-    except Exception as e:
-        return f"Wikipedia error: {str(e)}"
+        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{requests.utils.quote(subject)}"
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        return res.json().get('extract', 'No summary.') if res.status_code == 200 else "Wiki page not found."
+    except Exception as e: return f"Wiki error: {e}"
 
 def search_imdb(query: str) -> str:
+    """Search IMDb for movies, TV shows, and actors."""
+    return search_ddg(f"site:imdb.com {query}")
+
+def web_research(query: str) -> str:
+    """Search the web for a topic and return the 3 most relevant sources (title + link) plus one
+    synthesized 2-3 paragraph summary answering the query. Prefer this over search_ddg whenever the
+    user wants sources and a written answer, not just a quick fact."""
     try:
         with DDGS() as ddgs:
-            results = [r for r in ddgs.text(f"site:imdb.com {query}", max_results=3)]
-            if not results:
-                return f"No IMDb results found for '{query}'."
-            return "\n\n".join([f"IMDb Title: {r['title']}\nDetails: {r['body']}" for r in results])
+            results = list(ddgs.text(query, max_results=3))
     except Exception as e:
-        return f"IMDb search error: {str(e)}"
+        return f"Search error: {e}"
+
+    if not results:
+        return "No results found."
+
+    sources, source_texts = [], []
+    for i, r in enumerate(results, 1):
+        title = r.get('title', 'Untitled')
+        link = r.get('href') or r.get('link') or r.get('url', '')
+        sources.append(f"{i}. {title}\n   {link or 'No link available'}")
+
+        page_text = fetch_url_content(link) if link.startswith("http") else ""
+        if page_text and "error" not in page_text.lower():
+            source_texts.append(f"[Source {i}: {title}]\n{page_text[:2000]}")
+        else:
+            source_texts.append(f"[Source {i}: {title}]\n{r.get('body', 'No preview available.')}")
+
+    combined = "\n\n".join(source_texts)
+    try:
+        res = client.chat(model=SUB_MODEL_NAME, messages=[
+            {"role": "system", "content": (
+                "You are a research summarizer. Using ONLY the provided sources, write a 2-3 paragraph "
+                f"summary that directly answers this query: '{query}'. Synthesize across all sources rather "
+                "than listing them one by one. No fluff, no meta-commentary about the sources themselves."
+            )},
+            {"role": "user", "content": combined[:8000]}
+        ], options={"num_predict": 500, "temperature": 0.05})
+        summary = res.message.content.strip()
+    except Exception as e:
+        summary = f"[Summary generation error: {e}]"
+
+    return "Top sources:\n" + "\n".join(sources) + "\n\nSummary:\n" + summary
 
 def get_weather(location: str) -> str:
+    """Find current weather conditions."""
     try:
-        custom_format = "%l:+%C+(%c),+%t"
-        response = requests.get(f"https://wttr.in/{location}?format={custom_format}", timeout=5)
-        if response.status_code == 200:
-            return response.text.strip()
-        return f"Weather service returned status code {response.status_code}."
-    except Exception as e:
-        return f"Weather API error: {str(e)}"
+        safe_location = requests.utils.quote(location)
+        res = requests.get(f"https://wttr.in/{safe_location}?format=%l:+%C+(%c),+%t", timeout=5)
+        return res.text.strip() if res.status_code == 200 else "Weather unavailable."
+    except Exception as e: return f"Weather error: {e}"
 
 def read_file(filename: str) -> str:
-    safe_filename = filename.replace("filename=", "").strip()
-    safe_filename = os.path.basename(safe_filename)
-    filepath = os.path.join(WORKSPACE_DIR, safe_filename)
-    
-    if not os.path.exists(filepath):
-        return f"Error: File '{safe_filename}' does not exist."
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            return f.read()
-    except Exception as e:
-        return f"Error reading file: {str(e)}"
+    """Read a text file from the workspace."""
+    path = os.path.join(WORKSPACE_DIR, os.path.basename(filename))
+    if not os.path.exists(path): return f"File '{filename}' not found."
+    with open(path, 'r', encoding='utf-8') as f: return f.read()
 
-def write_file(filename_and_content: str) -> str:
-    try:
-        filename, content = filename_and_content.split('|', 1)
-        safe_filename = filename.replace("filename=", "").strip()
-        safe_filename = os.path.basename(safe_filename)
-        filepath = os.path.join(WORKSPACE_DIR, safe_filename)
-        
-        os.makedirs(WORKSPACE_DIR, exist_ok=True)
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(content.strip())
-        return f"Success: Wrote to '{safe_filename}'."
-    except ValueError:
-        return "Error: Action Input must be formatted as 'filename.txt|content'"
-    except Exception as e:
-        return f"Error writing file: {str(e)}"
-
-# --- System & Execution Tools ---
-def parse_system_data(key: str, raw_data: str) -> str:
-    """Cleans and formats raw /proc data for better LLM consumption."""
-    lines = raw_data.split('\n')
-    if key == 'meminfo':
-        return "\n".join([line for line in lines if 'Mem' in line or 'Swap' in line])
-    if key == 'cpuinfo':
-        model = next((l for l in lines if 'model name' in l), "Unknown CPU")
-        cores = len([l for l in lines if 'processor' in l])
-        return f"{model.strip()} | Cores: {cores}"
-    
-    # --- OBSERVATION INJECTION ---
-    if key == 'version':
-        base_output = raw_data[:500]
-        hint = "\n[System Hint: This only shows the kernel. To find the active compositor or window manager, use manage_processes.]"
-        return base_output + hint
-    # -----------------------------
-        
-    return raw_data[:500]
+def write_file(filename: str, content: str) -> str:
+    """Write text to a workspace file."""
+    os.makedirs(WORKSPACE_DIR, exist_ok=True)
+    with open(os.path.join(WORKSPACE_DIR, os.path.basename(filename)), 'w', encoding='utf-8') as f:
+        f.write(content.strip())
+    return f"Success: Wrote to '{filename}'."
 
 def read_system_proc(query: str) -> str:
-    HOST_PROC_DIR = "/host_proc"
-    proc_map = {'cpu': 'cpuinfo', 'mem': 'meminfo', 'uptime': 'uptime', 'version': 'version'}
-    filename = proc_map.get(query.lower(), query.lower())
-    full_path = os.path.join(HOST_PROC_DIR, filename)
-    
-    if not os.path.exists(full_path):
-        return f"Error: System path '{filename}' does not exist."
-    try:
-        with open(full_path, 'r', encoding='utf-8') as f:
-            raw = f.read()
-            return parse_system_data(filename, raw)
-    except Exception as e:
-        return f"Error reading system file: {str(e)}"
+    """Read host OS /proc paths. Query must be 'cpu', 'mem', 'uptime', or 'version'."""
+    path = os.path.join("/host_proc", query.lower() + ('info' if query.lower() in ['cpu', 'mem'] else ''))
+    if not os.path.exists(path): return f"Path '{query}' missing."
+    with open(path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+        if query.lower() == 'mem':
+            mem_total = mem_avail = 0
+            for l in lines:
+                if l.startswith('MemTotal:'): mem_total = int(l.split()[1])
+                elif l.startswith('MemAvailable:'): mem_avail = int(l.split()[1])
+            if mem_total and mem_avail:
+                used = mem_total - mem_avail
+                return f"Memory Used: {used/1024:.0f} MB / {mem_total/1024:.0f} MB ({(used/mem_total)*100:.1f}%)"
+            return "".join([l for l in lines if 'Mem' in l or 'Swap' in l])
+        if query.lower() == 'cpu': return f"{next((l for l in lines if 'model name' in l), 'Unknown')} | Cores: {len([l for l in lines if 'processor' in l])}"
+        return "".join(lines)[:500]
 
 def get_docker_info(query: str) -> str:
+    """Query host Docker containers. Query must be 'list' or 'memory'."""
     try:
-        docker_client = docker.from_env()
-        containers = docker_client.containers.list()
-        
-        if not containers:
-            return "No running containers found."
-
-        query = query.lower()
-        if "list" in query or "status" in query:
-            return "\n".join([f"{c.name}: {c.status}" for c in containers])
-            
-        elif "memory" in query or "stats" in query:
-            results = []
-            for c in containers:
-                stats = c.stats(stream=False)
-                mem_stats = stats.get('memory_stats', {})
-                mem_usage = mem_stats.get('usage', 0)
-                if mem_usage > 0:
-                    mem_mb = mem_usage / (1024 * 1024)
-                    results.append(f"{c.name}: {mem_mb:.2f} MB")
-                else:
-                    results.append(f"{c.name}: Memory data unavailable")
-            return "\n".join(results)
-        return "Command not recognized. Try 'list', 'status', or 'memory'."
-    except Exception as e:
-        return f"Docker API error: {str(e)}"
+        containers = docker.from_env().containers.list()
+        if not containers: return "No containers running."
+        if query == 'list': return "\n".join([f"{c.name}: {c.status}" for c in containers])
+        return "\n".join([f"{c.name}: {c.stats(stream=False).get('memory_stats', {}).get('usage', 0) / 1024**2:.2f} MB" for c in containers])
+    except Exception as e: return f"Docker error: {e}"
 
 def run_sandboxed_command(command: str) -> str:
-    """Executes a shell command inside a temporary, isolated Docker container."""
+    """Execute bash commands in a secure container."""
     try:
-        docker_client = docker.from_env()
-        
-        # We mount the workspace so the sandbox can interact with scripts created by the agent
-        # Use absolute path for the host side, assuming WORKSPACE_DIR is mapped appropriately or just bind the container path
-        output = docker_client.containers.run(
-            image="python:3.10-slim",
-            command=["/bin/sh", "-c", command],
-            remove=True,                  
-            mem_limit="512m",             
-            cpu_period=100000,
-            cpu_quota=50000,              
-            network_mode="bridge",        
-            volumes={os.path.abspath(WORKSPACE_DIR): {'bind': '/workspace', 'mode': 'rw'}},
-            working_dir="/workspace"      
+        out = docker.from_env().containers.run(
+            "python:3.10-slim", command=["/bin/bash", "-c", f"timeout 30 {command}"], remove=True, mem_limit="512m",
+            volumes={os.path.abspath(WORKSPACE_DIR): {'bind': '/workspace', 'mode': 'rw'}}, working_dir="/workspace"
         )
+        res = out.decode().strip() or "Success (No output)."
         
-        result = output.decode('utf-8').strip()
-        if not result:
-            return "Command executed successfully, but returned no output."
-            
-        return result[:4000] + "\n...[TRUNCATED]" if len(result) > 4000 else result
-        
-    except docker.errors.ContainerError as e:
-        error_output = e.stderr.decode('utf-8').strip() if e.stderr else str(e)
-        return f"Command failed with exit code {e.exit_status}:\n{error_output}"
-    except Exception as e:
-        return f"Sandbox execution error: {str(e)}"
+        if len(res) > 500:
+            return sub_agent_task(res, "Extract the specific error message or final outcome from this terminal log.")
+        return res[:4000]
+    except Exception as e: return f"Execution error: {e}"
 
-def list_workspace_files(query: str = "") -> str:
-    try:
-        search_pattern = query if query and query.lower() != 'all' else '**/*'
-        full_pattern = os.path.join(WORKSPACE_DIR, search_pattern)
-        files = glob.glob(full_pattern, recursive=True)
-        files = [os.path.relpath(f, WORKSPACE_DIR) for f in files if os.path.isfile(f)]
-        if not files: return f"No files found matching '{query}' in workspace."
-        return "\n".join(files)
-    except Exception as e:
-        return f"File listing error: {str(e)}"
+def list_workspace_files(pattern: str = "*") -> str:
+    """Search workspace file names. Pattern can be '*.txt' or '*'."""
+    files = [os.path.relpath(f, WORKSPACE_DIR) for f in glob.glob(os.path.join(WORKSPACE_DIR, pattern), recursive=True) if os.path.isfile(f)]
+    return "\n".join(files) if files else "No files found."
 
 def fetch_url_content(url: str) -> str:
-    if not url.startswith('http'): return "Error: URL must start with http:// or https://"
+    """Extract raw text content from a web page URL."""
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'lxml')
-        for script in soup(["script", "style", "nav", "footer"]):
-            script.extract()
-        text = soup.get_text(separator=' ', strip=True)
-        return text[:4000] + "\n...[TRUNCATED]" if len(text) > 4000 else text
-    except Exception as e:
-        return f"Error scraping URL: {str(e)}"
+        soup = BeautifulSoup(requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10).text, 'lxml')
+        for script in soup(["script", "style", "nav", "footer"]): script.extract()
+        return soup.get_text(separator=' ', strip=True)[:4000]
+    except Exception as e: return f"Scraping error: {e}"
+
+def scrape_and_summarize_url(url: str, goal: str) -> str:
+    """Delegates webpage reading to a fast 0.5B sub-agent to summarize information based on a goal, then saves it to memory."""
+    raw_text = fetch_url_content(url)
+    if "error" in raw_text.lower(): return raw_text
+    
+    try:
+        res = client.chat(model=SUB_MODEL_NAME, messages=[
+            {"role": "system", "content": "You are a concise research sub-agent. Extract facts from the text that directly answer the Goal. No fluff."},
+            {"role": "user", "content": f"Goal: {goal}\n\nText:\n{raw_text[:8000]}"}
+        ], options={"num_predict": 400, "temperature": 0.1})
+        summary = res.message.content.strip()
+        
+        if emb := get_ollama_embedding(summary):
+            doc_id = hashlib.md5(summary.encode()).hexdigest()
+            kb_collection.add(ids=[f"sub_{doc_id}"], embeddings=[emb], documents=[summary], metadatas=[{"source": url, "goal": goal}])
+        return f"Sub-Agent Summary:\n{summary}\n[Saved to DB]"
+    except Exception as e: return f"Sub-agent error: {e}"
 
 def manage_processes(query: str) -> str:
-    """Checks running processes and process counts."""
+    """Check running system processes. Query: 'count', 'top_cpu', 'top_mem', 'compositor', or a name."""
     try:
-        query = query.strip().lower()
+        procs = [p.info for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent'])]
+        if query in ['count', 'all']: return f"Total active processes: {len(procs)}"
+        if query == 'top_cpu': return "\n".join([f"{p['pid']}: {p['name']} ({p['cpu_percent']}%)" for p in sorted(procs, key=lambda x: x['cpu_percent'] or 0, reverse=True)[:5]])
+        if query == 'top_mem': return "\n".join([f"{p['pid']}: {p['name']} ({p['memory_percent']:.1f}%)" for p in sorted(procs, key=lambda x: x['memory_percent'] or 0, reverse=True)[:5]])
+        if query in ['compositor', 'wm', 'gui']:
+            wms = {p['name'] for p in procs if p['name'] and any(w in p['name'].lower() for w in ['hyprland', 'wayland', 'xorg', 'sway', 'kwin', 'dwm'])}
+            return f"Active WMs: {', '.join(wms)}" if wms else "No known WMs running."
         
-        processes = []
-        for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
-            processes.append(proc.info)
-
-        if query in ['list', 'all', 'count', 'status']:
-            return f"Total active processes: {len(processes)}\n(Note: To see specific processes, query 'top_cpu', 'top_mem', or a specific process name)."
-
-        if query == 'top_cpu':
-            top = sorted(processes, key=lambda p: p['cpu_percent'], reverse=True)[:5]
-            return "\n".join([f"PID {p['pid']}: {p['name']} (CPU: {p['cpu_percent']}%)" for p in top])
-            
-        elif query == 'top_mem':
-            top = sorted(processes, key=lambda p: p['memory_percent'], reverse=True)[:5]
-            return "\n".join([f"PID {p['pid']}: {p['name']} (RAM: {p['memory_percent']:.1f}%)" for p in top])
-            
-        # --- NEW: Categorical search for compositors ---
-        elif query in ['compositor', 'wm', 'desktop', 'gui']:
-            wm_list = ['hyprland', 'wayland', 'xorg', 'xwayland', 'sway', 'kwin', 'mutter', 'gnome-shell', 'xfwm4', 'dwm', 'i3', 'openbox']
-            matches = [p for p in processes if p['name'] and any(wm in p['name'].lower() for wm in wm_list)]
-            if not matches:
-                return "No known compositor/window manager processes found running."
-            
-            # Extract unique names to prevent spamming if there are 20 hyprland threads
-            unique_wms = set([p['name'] for p in matches])
-            return "Active compositor/WM processes found: " + ", ".join(unique_wms)
-        # -----------------------------------------------
-
-        else:
-            matches = [p for p in processes if p['name'] and query in p['name'].lower()]
-            if not matches: 
-                return f"No processes found matching '{query}'. Valid inputs are 'count', 'top_cpu', 'top_mem', 'compositor', or a specific process name."
-            return "\n".join([f"PID {p['pid']}: {p['name']} (CPU: {p['cpu_percent']}%, RAM: {p['memory_percent']:.1f}%)" for p in matches])
-            
-    except Exception as e:
-        return f"Process manager error: {str(e)}"
+        matches = [p for p in procs if p['name'] and query.lower() in p['name'].lower()]
+        return "\n".join([f"PID {p['pid']}: {p['name']} (CPU: {p['cpu_percent'] or 0}%, RAM: {p['memory_percent'] or 0}%)" for p in matches]) if matches else "Process not found."
+    except Exception as e: return f"Process error: {e}"
 
 def query_mariadb(sql_query: str) -> str:
-    if not sql_query.strip().upper().startswith("SELECT"):
-        return "Error: For safety, this tool only permits SELECT queries."
+    """Execute read-only SELECT queries on the database."""
+    if not all([DB_HOST, DB_USER, DB_PASS, DB_NAME]):
+        return "Database not configured. Set DB_HOST, DB_USER, DB_PASS, and DB_NAME environment variables to enable this tool."
+    if not sql_query.strip().upper().startswith("SELECT"): return "Error: Only SELECT permitted."
     try:
-        connection = pymysql.connect(
-            host=os.getenv('DB_HOST', '192.168.1.100'),
-            user=os.getenv('DB_USER', 'kodi'),
-            password=os.getenv('DB_PASS', 'kodi'),
-            database=os.getenv('DB_NAME', 'kodi_video121'),
-            cursorclass=pymysql.cursors.DictCursor
-        )
-        with connection.cursor() as cursor:
-            cursor.execute(sql_query)
-            result = cursor.fetchmany(10)
-        if not result: return "Query successful, but returned 0 rows."
-        return json.dumps(result, indent=2)
-    except Exception as e:
-        return f"Database error: {str(e)}"
-    finally:
-        if 'connection' in locals() and connection.open:
-            connection.close()
-
-def get_system_time(query: str = "") -> str:
-    return f"The current system date and time is {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}."
-
-# --- Knowledge Base Tools ---
-def get_ollama_embedding(text: str) -> list:
-    url = f"{OLLAMA_HOST}/api/embeddings"
-    payload = {"model": "nomic-embed-text", "prompt": text}
-    response = requests.post(url, json=payload).json()
-    return response.get('embedding', [])
-
-def ingest_url_to_knowledge_base(url: str) -> str:
-    """Scrapes a single URL and saves its chunks to ChromaDB."""
-    try:
-        text_content = fetch_url_content(url)
-        if "Error" in text_content: return text_content
-            
-        chunks = [c.strip() for c in text_content.split('\n\n') if len(c.strip()) > 50]
-        ingested = 0
-        
-        for i, chunk in enumerate(chunks):
-            doc_id = f"{url}_chunk_{i}"
-            if kb_collection.get(ids=[doc_id])['ids']: continue
+        with pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME, cursorclass=pymysql.cursors.DictCursor) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql_query)
+                rows = cursor.fetchmany(10)
+                raw_json = json.dumps(rows, indent=2) if rows else "0 rows returned."
                 
-            embedding = get_ollama_embedding(chunk)
-            if embedding:
-                kb_collection.add(
-                    ids=[doc_id], embeddings=[embedding],
-                    documents=[chunk], metadatas=[{"source": url}]
-                )
-                ingested += 1
-                
-        return f"Successfully ingested {ingested} chunks from {url} into the knowledge base."
-    except Exception as e:
-        return f"Knowledge base ingestion error: {str(e)}"
+                if rows:
+                    return sub_agent_task(raw_json, "Translate this raw JSON SQL output into a clean, concise bulleted text summary.")
+                return raw_json
+    except Exception as e: return f"DB error: {e}"
 
-def crawl_and_ingest_domain(start_url_and_max: str) -> str:
-    """Recursively crawls a domain and ingests pages into the knowledge base."""
+def get_system_time() -> str:
+    """Verify host target date and time."""
+    return f"Current date/time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+def get_date_info(date_str: str) -> str:
+    """Determine the day of the week for a specific date (YYYY-MM-DD)."""
+    try: return f"{date_str} was a {datetime.strptime(date_str, '%Y-%m-%d').strftime('%A')}."
+    except Exception as e: return f"Date format error: {e}"
+
+def calculate_age(birthdate_str: str) -> str:
+    """Calculate exact age in years and days based on a birthdate (YYYY-MM-DD)."""
     try:
-        parts = start_url_and_max.split('|')
-        start_url = parts[0].strip()
-        max_pages = int(parts[1].strip()) if len(parts) > 1 else 3
-    except ValueError:
-        return "Error: Action Input must be formatted exactly as 'https://example.com|5'"
-
-    if not start_url.startswith('http'):
-        return "Error: URL must start with http:// or https://"
-
-    base_domain = urlparse(start_url).netloc
-    visited, queue = set(), [start_url]
-    ingested_count = 0
-    log = []
-
-    while queue and ingested_count < max_pages:
-        current_url = queue.pop(0)
-        if current_url in visited: continue
-            
-        visited.add(current_url)
-        log.append(f"Crawling: {current_url}")
-        
-        # Ingest
-        ingest_result = ingest_url_to_knowledge_base(current_url)
-        if "Successfully" in ingest_result:
-            ingested_count += 1
-            
-        # Discover Links
-        try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-            response = requests.get(current_url, headers=headers, timeout=5)
-            soup = BeautifulSoup(response.text, 'lxml')
-            
-            for link in soup.find_all('a', href=True):
-                next_url = urljoin(current_url, link['href']).split('#')[0]
-                if urlparse(next_url).netloc == base_domain and next_url not in visited and next_url not in queue:
-                    if not any(next_url.lower().endswith(ext) for ext in ['.pdf', '.png', '.jpg', '.zip']):
-                        queue.append(next_url)
-        except Exception as e:
-            log.append(f"  -> Failed to parse links from {current_url}: {str(e)}")
-            
-        time.sleep(1) # Be polite to the server
-
-    log.append(f"Crawl complete. Successfully ingested {ingested_count} pages.")
-    return "\n".join(log)
+        bd = datetime.strptime(birthdate_str, "%Y-%m-%d")
+        age = relativedelta(datetime.now(), bd)
+        days = (datetime.now() - (bd + relativedelta(years=age.years))).days
+        return f"Age: {age.years} years, {days} days."
+    except Exception as e: return f"Age calc error: {e}"
 
 def query_knowledge_base(search_term: str) -> str:
-    """Searches the agent's internal vector database."""
+    """Query local vector memory."""
+    if kb_collection.count() == 0: return "Knowledge base empty."
+    res = kb_collection.query(query_embeddings=[get_ollama_embedding(search_term)], n_results=3)
+    return "\n\n---\n\n".join([f"[Source: {res['metadatas'][0][i].get('source', 'DB')}]\n{doc}" for i, doc in enumerate(res['documents'][0])]) if res['documents'][0] else "No info found."
+
+def ingest_url_to_knowledge_base(url: str) -> str:
+    """Permanently embed raw web URL text to vector DB."""
+    if "error" in (text := fetch_url_content(url).lower()): return text
+    chunks = [c.strip() for c in text.split('\n\n') if len(c.strip()) > 50]
+    count = 0
+    for i, c in enumerate(chunks):
+        doc_id = hashlib.md5(f"{url}_{i}".encode()).hexdigest()
+        if not kb_collection.get(ids=[doc_id])['ids']:
+            kb_collection.add(ids=[doc_id], embeddings=[get_ollama_embedding(c)], documents=[c], metadatas=[{"source": url}])
+            count += 1
+    return f"Ingested {count} chunks from {url}."
+
+def crawl_and_ingest_domain(start_url: str, max_pages: int = 3) -> str:
+    """Map out website domains to knowledge base."""
+    visited, queue, log = set(), [start_url], []
+    while queue and len(visited) < max_pages:
+        if (url := queue.pop(0)) in visited: continue
+        visited.add(url)
+        if "Ingested" in ingest_url_to_knowledge_base(url): log.append(f"Ingested: {url}")
+        try:
+            soup = BeautifulSoup(requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5).text, 'lxml')
+            queue.extend([u for link in soup.find_all('a', href=True) if urlparse(u := urljoin(url, link['href']).split('#')[0]).netloc == urlparse(start_url).netloc and u not in visited])
+        except Exception: pass
+        time.sleep(1)
+    return "\n".join(log) + f"\nCrawl complete. Pages processed: {len(visited)}."
+
+# Dynamic bindings
+AVAILABLE_TOOLS = [
+    search_ddg, search_wikipedia, search_imdb, web_research, get_weather, read_file, write_file,
+    read_system_proc, get_docker_info, run_sandboxed_command, list_workspace_files,
+    fetch_url_content, scrape_and_summarize_url, manage_processes, query_mariadb,
+    get_system_time, get_date_info, calculate_age, query_knowledge_base,
+    ingest_url_to_knowledge_base, crawl_and_ingest_domain
+]
+AVAILABLE_FUNCTIONS = {f.__name__: f for f in AVAILABLE_TOOLS}
+
+# --- Nomic Preprocessor Implementation ---
+def get_ollama_embedding(text: str) -> list:
     try:
-        if kb_collection.count() == 0: return "The knowledge base is empty. Ingest URLs first."
-            
-        query_embedding = get_ollama_embedding(search_term)
-        results = kb_collection.query(query_embeddings=[query_embedding], n_results=3)
+        return requests.post(f"{OLLAMA_HOST}/api/embeddings", json={"model": "nomic-embed-text", "prompt": text}, timeout=10).json().get('embedding', [])
+    except Exception: return []
+
+def init_few_shot_db():
+    if few_shot_collection.count() > 0: return
+    print("Initializing Nomic Dynamic Preprocessor...")
+    examples = [
+        ("hello", "This is a casual greeting. Reply directly with a friendly hello. No tools needed."),
+        ("hi there", "This is a casual greeting. Reply directly with a friendly hello. No tools needed."),
+        ("What's the weather in London?", "Use get_weather."),
+        ("What is the current wind speed?", "Use get_weather."),
+        ("Who is Microsoft's CEO?", "Use search_ddg or search_wikipedia."),
+        ("Age born on 1990-05-05?", "Use calculate_age and get_date_info with '1990-05-05'."),
+        ("Ping google", "Use run_sandboxed_command with 'ping -c 4 google.com'."),
+        ("Free RAM?", "Use read_system_proc with 'mem'."),
+        ("Summarize this site", "You MUST use the scrape_and_summarize_url tool."),
+        ("Search for recent news on X and summarize it", "Use web_research, not search_ddg alone."),
+        ("What's out there about Y? Give me sources.", "Use web_research, not search_ddg alone."),
+        ("What is the largest shark?", "DO NOT answer from memory. You MUST execute search_ddg or search_wikipedia first to verify."),
+        ("How far away is the moon?", "DO NOT answer from memory. You MUST execute search_ddg or search_wikipedia first to verify."),
+        ("Double check your answer", "Your previous answer is being challenged. DO NOT APOLOGIZE. You MUST execute the tool search_ddg immediately to find the truth."),
+        ("Are you sure?", "Your previous answer is being challenged. DO NOT APOLOGIZE. You MUST execute the tool search_ddg immediately to find the truth.")
+    ]
+    for text, hint in examples:
+        if emb := get_ollama_embedding(text):
+            doc_id = hashlib.md5(text.encode()).hexdigest()
+            few_shot_collection.add(ids=[doc_id], embeddings=[emb], documents=[hint])
+
+def preprocess_user_prompt(user_input: str) -> str:
+    # Clean the input to standard lowercase words
+    lower_input = re.sub(r'[^a-z\s]', '', user_input.lower().strip())
+    words = lower_input.split()
+    
+    # 1. Hardcoded Keyword Fallbacks 
+    verification_triggers = [
+        "are you sure", "double check", "verify that", "incorrect", 
+        "wrong", "that is false", "not true", "bullshit", "untrue"
+    ]
+    if any(trigger in lower_input for trigger in verification_triggers):
+        return f"{user_input}\n\n[SYSTEM HINT: Your previous answer is being challenged or corrected by the user. DO NOT APOLOGIZE or blindly agree. Do not assume you are wrong. You MUST immediately execute the search_ddg tool to pull real-time data and objectively verify the truth before replying.]"
         
-        if not results['documents'][0]: return "No relevant information found."
-            
-        output = []
-        for i, doc in enumerate(results['documents'][0]):
-            source = results['metadatas'][0][i]['source']
-            output.append(f"[Source: {source}]\n{doc}")
-            
-        return "\n\n---\n\n".join(output)
-    except Exception as e:
-        return f"Knowledge base search error: {str(e)}"
+    weather_triggers = ["weather", "temperature", "forecast", "wind", "speed", "conditions"]
+    if any(trigger in lower_input for trigger in weather_triggers):
+        return f"{user_input}\n\n[SYSTEM HINT: You MUST use the get_weather tool to find the current conditions.]"
 
-def clear_screen():
-    os.system('cls' if os.name == 'nt' else 'clear')
+    # URL and Web Scraping Interceptor
+    url_triggers = ["http://", "https://", "www.", "scrape", "fetch", "summarize site"]
+    if any(trigger in lower_input for trigger in url_triggers):
+        return f"{user_input}\n\n[SYSTEM HINT: DO NOT state that you cannot browse the internet. You possess tools for this. You MUST execute the `fetch_url_content` or `scrape_and_summarize_url` tool to process the requested web page.]"
 
-# --- Tool Mapping & Prompts ---
-tools_map = {
-    'search_ddg': search_ddg,
-    'search_wikipedia': search_wikipedia,
-    'search_imdb': search_imdb,
-    'get_weather': get_weather,
-    'read_file': read_file,
-    'write_file': write_file,
-    'read_system_proc': read_system_proc,
-    'get_docker_info': get_docker_info,
-    'run_sandboxed_command': run_sandboxed_command,
-    'list_workspace_files': list_workspace_files,
-    'fetch_url_content': fetch_url_content,
-    'manage_processes': manage_processes,
-    'query_mariadb': query_mariadb,
-    'ingest_url_to_knowledge_base': ingest_url_to_knowledge_base,
-    'crawl_and_ingest_domain': crawl_and_ingest_domain,
-    'query_knowledge_base': query_knowledge_base,
-    'get_system_time': get_system_time
-}
+    # Time and Date Check
+    time_triggers = ["what time", "current time", "date is it", "todays date", "what day"]
+    if any(trigger in lower_input for trigger in time_triggers):
+        return f"{user_input}\n\n[SYSTEM HINT: You MUST use the get_system_time tool to check the host clock.]"
 
-current_time = datetime.now().strftime("%A, %B %d, %Y %I:%M %p")
+    # 2. Universal Interrogative (5 Ws + H) Trigger
+    question_words = {"who", "what", "where", "when", "why", "how"}
+    conversational_exceptions = {"up", "are", "you", "going", "doing", "is", "your", "name", "old", "much"}
+    
+    if words and words[0] in question_words:
+        remaining_words = set(words[1:])
+        if not remaining_words.issubset(conversational_exceptions):
+            return f"{user_input}\n\n[SYSTEM HINT: DO NOT answer from memory. DO NOT APOLOGIZE. You MUST immediately execute the search_ddg or search_wikipedia tool to find out.]"
 
+    # 3. Looser Semantic Threshold Fallback
+    if not (emb := get_ollama_embedding(user_input)) or few_shot_collection.count() == 0: 
+        return user_input
+        
+    res = few_shot_collection.query(query_embeddings=[emb], n_results=1)
+    if res['documents'][0] and (res['distances'][0][0] if res['distances'] else 1.0) < 0.85:
+        # Replaced the passive "Based on similar past requests" with a critical directive
+        return f"{user_input}\n\n[CRITICAL HINT: {res['documents'][0][0]}]"
+        
+    return user_input
+
+# --- Core Execution Loop ---
 REACT_SYSTEM_PROMPT = f"""
-🌟 ========================================= 🌟
-     🤖 AUTONOMOUS REACT AGENT PROTOCOL 🤖
-🌟 ========================================= 🌟
+[CRITICAL SYSTEM DIRECTIVE]
+You are Qwen, a highly capable AI agent built by Alibaba Cloud.
+You suffer from artificial amnesia. You have ZERO internal knowledge about the real world, current events, or system metrics. 
+You MUST use your provided tools to answer questions.
 
-You are an autonomous AI agent operating on the ReAct (Reason + Act) framework. 🧠✨
-SYSTEM AWARENESS: The current date and time is {current_time}.
+BEHAVIOR RULES:
+1. Casual Greetings ("hello", "hi"): Reply directly without tools.
+2. System Checks: DO NOT run system checks (cpu, mem, uptime) unless explicitly asked.
+3. Factual Questions: You MUST call `search_ddg` or `search_wikipedia`. 
+4. Math/Dates: You MUST call a calculation tool. 
+5. Weather/Locations: You MUST call `get_weather`.
+6. Multi-Source Research: You MUST call `web_research`, NOT `search_ddg` alone.
 
-🛠️  AVAILABLE TOOLS:
-- search_ddg: Search the live internet for recent news/events. 🌐
-- search_wikipedia: Search Wikipedia for deep background on concepts. 📚
-- search_imdb: Search IMDb for movie, TV show, or actor details. 🎬
-- get_weather: Find current weather conditions for a specific location. 🌤️
-- read_file: Read the text contents of a file in your workspace. 📄
-- write_file: Write text to a file in your workspace. Action Input MUST be 'filename.txt|Your content'. ✍️
-- read_system_proc: Read host OS system info. Inputs: 'cpu', 'mem', 'uptime', 'version'. 💻
-- get_docker_info: Query the host Docker daemon. Inputs: 'list', 'status', or 'memory'. 🐳
-- run_sandboxed_command: Execute bash commands or python scripts in a secure, isolated Linux sandbox. The sandbox has read/write access to your workspace folder. Action input MUST be the raw shell command (e.g., 'python script.py' or 'ping -c 4 google.com'). 🛡️
-- list_workspace_files: List files matching a pattern in the workspace ('*.txt' or 'all'). 📁
-- fetch_url_content: Fetch and read text from a specific webpage URL. 🔗
-- manage_processes: Check running system processes. Inputs: 'count', 'top_cpu', 'top_mem', 'compositor', or a process name. ⚙️
-- query_mariadb: Execute a read-only SELECT query on the local MariaDB database. 🗄️
-- ingest_url_to_knowledge_base: Read a single webpage and permanently save it to your vector memory. Action input MUST be a valid URL. 📥
-- crawl_and_ingest_domain: Recursively spider a website to build your knowledge base. Action input MUST be formatted as 'url|max_pages' (e.g., 'https://wiki.archlinux.org/|5'). 🕷️
-- query_knowledge_base: Search your permanent vector memory for facts or previously ingested data. Action input should be a precise search term. 🧠
-- get_system_time: Check the current date, time, or year. 🕒
+STRICT FORMATTING RULES:
+- NEVER apologize.
+- NEVER explain your thought process before calling a tool.
+- NEVER output raw JSON text in your conversational response.
+- Execute the native function calling API immediately when a tool is required.
 
-⚙️  OUTPUT FORMAT (TWO PATHS):
-
-PATH 1: CASUAL CHAT (FAST-TRACK)
-If the user is just saying hello, thanking you, or asking a casual question that requires NO tools, completely skip the Thought and Action steps. 
-Immediately output:
-Final Answer: your conversational response.
-⚠️ CRITICAL: DO NOT use this path if the user asks for LIVE or FACTUAL data. For those, you MUST use PATH 2.
-
-PATH 2: TOOL USE REQUIRED
-If you need to look up information, read files, or check the system, you MUST use the strict ReAct format:
-Thought: your internal reasoning about what to do next
-Action: the exact tool name 
-Action Input: the query to pass to the tool
-
-(You will then receive an Observation from the system, and you can repeat this cycle 🔄)
-When you have the information, conclude with:
-Thought: I now have the final answer. 💡
-Final Answer: your response to the user.
-
-🚨 CRITICAL RULES:
-- NEVER generate the "Observation:" text yourself! 🛑
-- NEVER output a "Final Answer" in the same step as an "Action". After writing the Action Input, you must STOP! ⚠️
-- NEVER use placeholders like [Insert Data Here]. 
+SYSTEM TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.
 """
 
-def load_memory():
-    if os.path.exists(MEMORY_FILE):
-        try:
-            with open(MEMORY_FILE, 'r') as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
-
-def save_memory(messages):
-    os.makedirs(os.path.dirname(MEMORY_FILE), exist_ok=True)
-    with open(MEMORY_FILE, 'w') as f:
-        json.dump(messages, f, indent=2)
-
-def parse_react_output(text):
-    action_match = re.search(r"Action:\s*(.*)", text)
-    input_match = re.search(r"Action Input:\s*(.*)", text)
-    
-    if action_match and input_match:
-        return {
-            "type": "action",
-            "action": action_match.group(1).strip(),
-            "input": input_match.group(1).strip()
-        }
-        
-    if "Final Answer:" in text:
-        return {"type": "finish", "content": text.split("Final Answer:")[-1].strip()}
-        
-    if "Action:" in text or "Action Input:" in text:
-        return {"type": "invalid", "content": text.strip()}
-        
-    clean_text = text.replace("Thought:", "").strip()
-    return {"type": "finish", "content": clean_text}
+def save_memory(msgs):
+    with open(MEMORY_FILE, 'w') as f: json.dump(msgs, f, indent=2)
 
 def execute_react_loop(messages, verbose=False):
-    max_steps = 5
-    
-    for step in range(max_steps):
-        if not verbose:
-            sys.stdout.write(f"\r\033[K💭 Thinking (Step {step+1})... ")
-            sys.stdout.flush()
-
-        response = client.chat(
-            model=MODEL_NAME, 
-            messages=messages,
-            options={
-                "num_ctx": 16384,
-                "stop": ["Observation:", "\nObservation:"]
-            }
-        )
+    for step in range(5):
+        if not verbose: sys.stdout.write(f"\r\033[K💭 Thinking (Step {step+1})... ")
         
-        try:
-            metrics = dict(response)
-            eval_count = metrics.get('eval_count', 0)
-            eval_duration = metrics.get('eval_duration', 0)
-            if eval_count and eval_duration:
-                tps = eval_count / (eval_duration / 1e9)
-                tps_string = f" ⚡ [{tps:.1f} t/s]"
-            else:
-                tps_string = ""
-        except Exception:
-            tps_string = ""
+        response = client.chat(model=MODEL_NAME, messages=messages, tools=AVAILABLE_TOOLS, options={"num_ctx": OLLAMA_CTX, "temperature": 0.0})
+        msg = response.message
         
-        content = response.message.content
-        
-        if verbose:
-            print(f"\n--- [Internal Monologue Step {step+1}] ---\n{content.strip()}\n{tps_string}\n-------------------------------")
-        
-        messages.append({"role": "assistant", "content": content})
-        parsed = parse_react_output(content)
-        
-        if parsed["type"] == "finish":
-            if not verbose:
-                sys.stdout.write("\r\033[K")
-                sys.stdout.flush()
-            return parsed["content"] + tps_string, messages
+        # --- Enhanced Safety Net for Markdown-Leaked JSON Tool Calls ---
+        if not msg.tool_calls and msg.content:
+            clean_content = msg.content.strip()
+            json_match = re.search(r'\{.*"name".*\}', clean_content, re.DOTALL)
             
-        elif parsed["type"] == "invalid":
-            feedback = "System Notice: You provided a Thought but did not specify an Action or Final Answer. You must pick an explicit Action and Action Input from the available tools list to proceed."
-            if verbose: print(f"⚠️  Format Error caught. Sending correction feedback.")
-            messages.append({"role": "user", "content": feedback})
-            continue
+            if json_match:
+                try:
+                    leaked_tool = json.loads(json_match.group(0))
+                    class MockFunc:
+                        def __init__(self, name, args): self.name, self.arguments = name, args
+                    class MockTool:
+                        def __init__(self, func): self.function = func
+                        
+                    if "name" in leaked_tool:
+                        msg.tool_calls = [MockTool(MockFunc(leaked_tool["name"], leaked_tool.get("arguments", {})))]
+                        msg.content = ""
+                except json.JSONDecodeError:
+                    pass
+        # --------------------------------------------------------------------
+        
+        if verbose and msg.content: print(f"\n--- [Step {step+1}] ---\n{msg.content.strip()}\n-------------------------------")
+        
+        msg_dict = {"role": msg.role or "assistant", "content": msg.content or ""}
+        if msg.tool_calls:
+            msg_dict["tool_calls"] = [{"function": {"name": tc.function.name, "arguments": tc.function.arguments}} for tc in msg.tool_calls]
             
-        elif parsed["type"] == "action":
-            tool_name = parsed["action"]
-            tool_input = parsed["input"]
+        # SAFEGUARD: Do not append completely empty assistant turns to memory
+        if msg_dict["content"].strip() or "tool_calls" in msg_dict:
+            messages.append(msg_dict)
+        else:
+            # If the model bugged out and returned nothing, force a fallback to prevent history corruption
+            fallback_text = "I encountered an empty response from the model. Please try again."
+            messages.append({"role": "assistant", "content": fallback_text})
+            msg.content = fallback_text  # <-- CRITICAL FIX: Ensures it prints!
+        
+        if not msg.tool_calls:
+            if not verbose: sys.stdout.write("\r\033[K")
+            return msg.content or "", messages
             
-            if verbose:
-                print(f"🛠️  System Executing: {tool_name}('{tool_input}')")
-            else:
-                sys.stdout.write(f"\r\033[K🛠️  Running tool: {tool_name}... ")
-                sys.stdout.flush()
+        for tool in msg.tool_calls:
+            func_name = tool.function.name
+            raw_args = tool.function.arguments
             
-            if tool_name in tools_map:
-                observation = tools_map[tool_name](tool_input)
-            else:
-                observation = f"Error: Tool '{tool_name}' not recognized."
+            func_args = {}
+            if raw_args:
+                for k, v in raw_args.items():
+                    if isinstance(v, dict) and 'value' in v:
+                        func_args[k] = v['value']
+                    else:
+                        func_args[k] = v
+            
+            if verbose: print(f"🛠️  Executing: {func_name}({func_args})")
+            else: sys.stdout.write(f"\r\033[K🛠️  Running tool: {func_name}... ")
+            
+            try:
+                obs = str(AVAILABLE_FUNCTIONS[func_name](**func_args))[:1500] if func_name in AVAILABLE_FUNCTIONS else f"Error: Tool '{func_name}' not found."
+            except Exception as e:
+                obs = f"Execution error in {func_name}: {e}"
                 
-            observation = str(observation)[:1500] 
+            if verbose: print(f"👁️  Observation loaded.\n")
+            messages.append({"role": "tool", "name": func_name, "content": obs})
             
-            if verbose: print(f"👁️  System Observation: {observation[:75]}...\n")
-            messages.append({"role": "user", "content": f"Observation: {observation}"})
-            
-    if not verbose:
-        sys.stdout.write("\r\033[K")
-        sys.stdout.flush()
-    return "Error: Reached maximum iterations without a final answer.", messages
+    if not verbose: sys.stdout.write("\r\033[K")
+    return "Error: Max iterations reached.", messages
 
 def main():
-    print("Connecting to Ollama service...")
-    try:
-        client.pull(MODEL_NAME)
-    except Exception as e:
-        print(f"Error connecting/pulling model: {e}")
-        sys.exit(1)
+    print("Connecting & Pulling Models...", flush=True)
+    
+    for i in range(30):  # Increased to 30 for a 60-second wait window
+        try:
+            client.pull(MODEL_NAME)
+            client.pull(SUB_MODEL_NAME)
+            break
+        except Exception:
+            if i == 29: sys.exit("Ollama connection error: Server did not respond.")
+            time.sleep(2)
 
-    messages = load_memory()
+    global kb_collection, few_shot_collection
+    
+    init_few_shot_db()
+    messages = json.load(open(MEMORY_FILE)) if os.path.exists(MEMORY_FILE) else [{"role": "system", "content": REACT_SYSTEM_PROMPT}]
     verbose_mode = False
     
-    if not messages:
-        messages.append({"role": "system", "content": REACT_SYSTEM_PROMPT})
-    clear_screen()
-    print(f"\n=== ReAct Agent Active (Model: {MODEL_NAME}) ===\n")
-    print("🛠️  AVAILABLE TOOLS:")
-    print("  🌐 search_ddg          : Search the live internet for recent news/events")
-    print("  📚 search_wikipedia    : Search Wikipedia for deep background info")
-    print("  🌤️ get_weather         : Find current weather conditions for a location")
-    print("  📄 read_file           : Read the text contents of a workspace file")
-    print("  ✍️ write_file          : Write text to a file in your workspace")
-    print("  💻 read_system_proc    : Read host OS system info (CPU, RAM, Uptime)")
-    print("  🐳 get_docker_info     : Query running Docker containers (list, status, memory)")
-    print("  🛡️ run_sandboxed_cmd   : Run scripts/commands in a secure isolated sandbox")
-    print("  📁 list_workspace_files: List files matching a pattern in the workspace")
-    print("  🔗 fetch_url_content   : Fetch and extract text from a webpage")
-    print("  ⚙️ manage_processes    : Check running processes (count, top_cpu, top_mem, search)")
-    print("  🗄️ query_mariadb       : Execute read-only queries on the MariaDB database")
-    print("  📥 ingest_url          : Save a single URL to your vector memory")
-    print("  🕷️ crawl_domain        : Spider and ingest an entire domain (max depth)")
-    print("  🧠 query_kb            : Search your permanent local vector database\n")
-    print("⌨️  COMMANDS:")
-    print("  🧠 /think              : Toggle verbose internal monologue")
-    print("  🧹 /wipe               : Clear chat memory and start fresh")
-    print("  💥 /wipe_kb            : Delete and reset the ChromaDB vector database")
-    print("  📋 /copy               : Copy the last agent response to clipboard")
-    print("  🛑 exit / quit         : End the session and save history")
-    print("=========================================================\n")
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print(f"=== Agent Active ({MODEL_NAME}) ===\nTools loaded: {len(AVAILABLE_TOOLS)}\nCommands: /think, /wipe, /wipe_kb, /copy, exit\n")
 
-    bad_file = os.path.join(WORKSPACE_DIR, "filename=tokyo_weather.txt")
-    if os.path.exists(bad_file):
-        try: os.remove(bad_file)
-        except Exception: pass
-
-    os.makedirs(os.path.dirname(CMD_HISTORY_FILE), exist_ok=True)
-    autocomplete_words = ['/think', '/wipe', '/wipe_kb', '/copy', 'exit', 'quit'] + list(tools_map.keys())
-    completer = WordCompleter(autocomplete_words, ignore_case=True)
-    
-    global kb_collection 
     session = PromptSession(history=FileHistory(CMD_HISTORY_FILE))
-
-    first_prompt = True
-    last_agent_response = ""
+    completer = WordCompleter(['/think', '/wipe', '/wipe_kb', '/copy', 'exit', 'quit'] + list(AVAILABLE_FUNCTIONS.keys()), ignore_case=True)
+    last_response = ""
 
     while True:
         try:
-            if first_prompt:
-                user_input = session.prompt("👤: ", completer=completer).strip()
-                first_prompt = False
-            else:
-                user_input = session.prompt("\n👤: ", completer=completer).strip()
-                
+            user_input = session.prompt("👤: ", completer=completer).strip()
             if not user_input: continue
+            
+            if (cmd := user_input.lower()) in ['exit', 'quit']:
+                save_memory(messages); break
+            if cmd == '/think':
+                verbose_mode = not verbose_mode; print(f"🔧 Verbose mode: {'ON' if verbose_mode else 'OFF'}"); continue
+            if cmd == '/wipe':
+                messages = [{"role": "system", "content": REACT_SYSTEM_PROMPT}]; save_memory(messages); print("🧹 Memory wiped."); continue
+            
+            if cmd == '/wipe_kb':
+                for coll_name in ["agent_knowledge", "agent_few_shot"]:
+                    try: chroma_client.delete_collection(coll_name)
+                    except Exception: pass
                 
-            if user_input.lower() in ['exit', 'quit']:
-                save_memory(messages)
-                print("History saved. Goodbye!")
-                break
-                
-            if user_input.lower() == '/think':
-                verbose_mode = not verbose_mode
-                status = "ON" if verbose_mode else "OFF"
-                print(f"🔧 Verbose thinking mode turned {status}.")
-                continue
-                
-            if user_input.lower() == '/wipe':
-                messages = [{"role": "system", "content": REACT_SYSTEM_PROMPT}]
-                save_memory(messages)
-                print("🧹 Memory wiped. Context reset!")
-                continue
-
-            if user_input.lower() == '/wipe_kb':
                 try:
-                    chroma_client.delete_collection(name="agent_knowledge")
-                    kb_collection = chroma_client.create_collection(name="agent_knowledge")
-                    print("🧠 Knowledge base wiped completely!")
-                except Exception as e:
-                    print(f"⚠️ Error wiping knowledge base: {e}")
-                continue
-
-            if user_input.lower() == '/copy':
-                if last_agent_response:
-                    copy_to_clipboard(last_agent_response)
-                    print("📋 Copied last response to host clipboard!")
-                else: print("⚠️ Nothing to copy yet.")
+                    kb_collection = chroma_client.get_or_create_collection("agent_knowledge")
+                    few_shot_collection = chroma_client.get_or_create_collection("agent_few_shot")
+                    init_few_shot_db()
+                    print("🧠 KB and Few-Shot databases wiped and reset.")
+                except Exception as e: 
+                    print(f"⚠️ Error recreating collections: {e}")
                 continue
             
-            messages.append({"role": "user", "content": user_input})
-            final_response, messages = execute_react_loop(messages, verbose=verbose_mode)
-            last_agent_response = final_response
-            print(f"💻: {final_response}")
+            if cmd == '/copy':
+                copy_to_clipboard(last_response); print("📋 Copied!"); continue
+            
+            enriched_input = preprocess_user_prompt(user_input)
+            if verbose_mode and enriched_input != user_input: print("✨ [Nomic Preprocessor Triggered]")
+
+            messages.append({"role": "user", "content": enriched_input})
+            last_response, messages = execute_react_loop(messages, verbose=verbose_mode)
+            print(f"💻: {last_response}")
             save_memory(messages)
 
         except (KeyboardInterrupt, EOFError):
-            save_memory(messages)
-            print("\nSession saved. Exiting.")
-            break
+            save_memory(messages); break
 
 if __name__ == "__main__":
     main()

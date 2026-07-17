@@ -24,6 +24,10 @@ services:
     environment:
       - OLLAMA_HOST=http://ollama:11434
       - TZ=America/Toronto
+      - DB_HOST=${DB_HOST:-}
+      - DB_USER=${DB_USER:-}
+      - DB_PASS=${DB_PASS:-}
+      - DB_NAME=${DB_NAME:-}
     volumes:
       - ./memory:/app/memory
       - ./workspace:/app/workspace
