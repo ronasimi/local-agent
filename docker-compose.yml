@@ -10,16 +10,24 @@ services:
       - /dev/kfd:/dev/kfd
       - /dev/dri:/dev/dri
     environment:
-      - OLLAMA_CONTEXT_LENGTH=16384
+      - OLLAMA_CONTEXT_LENGTH=8096
+      - OLLAMA_KEEP_ALIVE=0s
       - OLLAMA_VULKAN=1
       - OLLAMA_IGPU_ENABLE=1
     restart: always
+    healthcheck:
+      test: ollama list || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   agent:
     build: .
     container_name: terminal_agent
     depends_on:
-      - ollama
+      ollama:
+        condition: service_healthy
     pid: "host"
     environment:
       - OLLAMA_HOST=http://ollama:11434
