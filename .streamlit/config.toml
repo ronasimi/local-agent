@@ -1,0 +1,14 @@
+[theme]
+# Blue accent
+primaryColor = "#8ab4f8"
+
+# Main pane background
+backgroundColor = "#2e2e2e"
+
+# Sidebar background
+secondaryBackgroundColor = "#272727"
+
+# Main text color
+textColor = "#c3c3c3"
+
+font = "sans serif"

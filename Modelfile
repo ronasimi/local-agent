@@ -1,36 +1,25 @@
-FROM phi4-mini
+FROM qwen2.5-coder:3b
 
-TEMPLATE """{{- if .Messages }}
-{{- if or .System .Tools }}<|system|>
-{{- if .System }}{{ .System }}{{ end }}
-{{- if .Tools }}
-Use the following rule to decide when to call a function:
-* if you need external information that can be obtained by calling one or more of the provided functions, generate a function call.
+TEMPLATE """{{ if .System }}<|im_start|>system
+{{ .System }}{{ if .Tools }}
 
-If you decide to call functions:
-* prefix function calls with functools marker (no closing marker required)
-* all function calls should be generated in a single JSON list formatted as functools[{"name": [function name], "arguments": [function arguments as JSON]}, ...]
-* follow the provided JSON schema. Do not hallucinate arguments or values.
-Available functions as JSON spec:
+# Tools
+
+You may call one or more tools to assist with the user request.
+
+You are provided with the following tools in JSON format:
 {{ .Tools }}
-{{- end }}<|end|>
-{{- end }}
-{{- range $i, $_ := .Messages }}
-{{- $last := eq (len (slice $.Messages $i)) 1 -}}
-{{- if ne .Role "system" }}<|{{ .Role }}|>
-{{- if and .Content (eq .Role "tool") }}
-{"result": {{ .Content }}}
-{{- else if .Content }}
-{{ .Content }}
-{{- else if .ToolCalls }}
-functools[{{ range .ToolCalls }}{"name": "{{ .Function.Name }}", "arguments": {{ .Function.Arguments }}}{{ end }}]
-{{- end }}<|end|>
-{{- end }}
-{{- if and (ne .Role "assistant") $last }}<|assistant|>{{ end }}
-{{- end }}
-{{- else }}
-{{- if .System }}<|system|>
-{{ .System }}<|end|>{{ end }}
-{{- if .Prompt }}<|user|>
-{{ .Prompt }}<|end|>{{ end }}<|assistant|>
-{{- end }}"""
+
+To call a function, respond with a JSON object matching the tool call schema.
+{{- end }}<|im_end|>
+{{ end }}{{ range .Messages }}{{ if eq .Role "user" }}<|im_start|>user
+{{ .Content }}<|im_end|>
+{{ else if eq .Role "assistant" }}<|im_start|>assistant
+{{ if .Content }}{{ .Content }}{{ end }}{{ if .ToolCalls }}[{"name": "{{ (index .ToolCalls 0).Function.Name }}", "arguments": {{ (index .ToolCalls 0).Function.Arguments }}}]{{ end }}<|im_end|>
+{{ else if eq .Role "tool" }}<|im_start|>user
+[TOOL OBSERVATION]: {{ .Content }}<|im_end|>
+{{ end }}{{ end }}<|im_start|>assistant
+"""
+
+PARAMETER temperature 0.0
+PARAMETER stop "<|im_end|>"

@@ -11,4 +11,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy your source code
 COPY . .
 
-CMD ["python3", "agent.py"]
+# Start the Streamlit web server
+CMD ["python3", "-m", "streamlit", "run", "web_app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]

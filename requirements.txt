@@ -10,3 +10,4 @@ psutil
 pymysql
 chromadb
 pymupdf
+streamlit

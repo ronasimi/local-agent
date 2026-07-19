@@ -5,22 +5,22 @@ import config
 def init_few_shot_db():
     if config.few_shot_collection.count() > 0: return
     print("Initializing Nomic Dynamic Preprocessor...")
+    
+    # Casual greetings have been removed from the Vector DB to prevent false-positive tool triggers
     examples = [
-        ("hello", "This is a casual greeting. Reply directly with a friendly hello. No tools needed."),
-        ("hi there", "This is a casual greeting. Reply directly with a friendly hello. No tools needed."),
-        ("What's the weather in London?", "Use get_weather."),
-        ("What is the current wind speed?", "Use get_weather."),
-        ("Who is Microsoft's CEO?", "Use search_ddg or search_wikipedia."),
-        ("Age born on 1990-05-05?", "Use calculate_age and get_date_info with '1990-05-05'."),
-        ("Ping google", "Use run_sandboxed_command with 'ping -c 4 google.com'."),
-        ("Free RAM?", "Use read_system_proc with 'mem'."),
-        ("Summarize this site", "You MUST use the scrape_and_summarize_url tool."),
-        ("Search for recent news on X and summarize it", "Use web_research, not search_ddg alone."),
-        ("What's out there about Y? Give me sources.", "Use web_research, not search_ddg alone."),
-        ("What is the largest shark?", "DO NOT answer from memory. You MUST execute search_ddg or search_wikipedia first to verify."),
-        ("How far away is the moon?", "DO NOT answer from memory. You MUST execute search_ddg or search_wikipedia first to verify."),
-        ("Double check your answer", "Your previous answer is being challenged. DO NOT APOLOGIZE. You MUST execute the tool search_ddg immediately to find the truth."),
-        ("Are you sure?", "Your previous answer is being challenged. DO NOT APOLOGIZE. You MUST execute the tool search_ddg immediately to find the truth.")
+        ("What's the weather in London?", "[ACTION REQUIRED: Generate a JSON tool call for 'get_weather'. DO NOT converse.]"),
+        ("What is the current wind speed?", "[ACTION REQUIRED: Generate a JSON tool call for 'get_weather'. DO NOT converse.]"),
+        ("Who is Microsoft's CEO?", "[ACTION REQUIRED: Generate a JSON tool call for 'search_ddg' or 'search_wikipedia'. DO NOT answer from memory.]"),
+        ("Age born on 1990-05-05?", "[ACTION REQUIRED: Generate a JSON tool call for 'calculate_age' and 'get_date_info'. DO NOT calculate manually.]"),
+        ("Ping google", "[ACTION REQUIRED: Generate a JSON tool call for 'run_sandboxed_command' with 'ping -c 4 google.com'.]"),
+        ("Free RAM?", "[ACTION REQUIRED: Generate a JSON tool call for 'read_system_proc' with 'mem'.]"),
+        ("Summarize this site", "[ACTION REQUIRED: Generate a JSON tool call for 'scrape_and_summarize_url'.]"),
+        ("Search for recent news on X and summarize it", "[ACTION REQUIRED: Generate a JSON tool call for 'web_research'.]"),
+        ("What's out there about Y? Give me sources.", "[ACTION REQUIRED: Generate a JSON tool call for 'web_research'.]"),
+        ("What is the largest shark?", "[ACTION REQUIRED: Generate a JSON tool call for 'search_ddg' or 'search_wikipedia'. DO NOT answer from memory.]"),
+        ("How far away is the moon?", "[ACTION REQUIRED: Generate a JSON tool call for 'search_ddg' or 'search_wikipedia'. DO NOT answer from memory.]"),
+        ("Double check your answer", "[ACTION REQUIRED: Generate a JSON tool call for 'search_ddg'. DO NOT apologize.]"),
+        ("Are you sure?", "[ACTION REQUIRED: Generate a JSON tool call for 'search_ddg'. DO NOT apologize.]")
     ]
     for text, hint in examples:
         if emb := config.get_ollama_embedding(text):
@@ -32,43 +32,49 @@ def preprocess_user_prompt(user_input: str) -> str:
     lower_input = re.sub(r'[^a-z\s]', '', user_input.lower().strip())
     words = lower_input.split()
     
-    # 1. Hardcoded Keyword Fallbacks 
+    # 1. Comprehensive Greeting & Chit-Chat Escape Hatch
+    greeting_keywords = {"hello", "hi", "hey", "yo", "greetings", "sup", "morning", "afternoon", "evening"}
+    if words and (words[0] in greeting_keywords or "whats up" in lower_input or "what sup" in lower_input or "how are you" in lower_input or "shakin" in lower_input):
+        return user_input
+        
+    # 2. Hardcoded Keyword Fallbacks 
     verification_triggers = [
         "are you sure", "double check", "verify that", "incorrect", 
         "wrong", "that is false", "not true", "bullshit", "untrue"
     ]
     if any(trigger in lower_input for trigger in verification_triggers):
-        return f"{user_input}\n\n[SYSTEM HINT: Your previous answer is being challenged or corrected by the user. DO NOT APOLOGIZE or blindly agree. Do not assume you are wrong. You MUST immediately execute the search_ddg tool to pull real-time data and objectively verify the truth before replying.]"
+        return f"{user_input}\n\n[ACTION REQUIRED: Your previous answer is being challenged. DO NOT APOLOGIZE. Generate a JSON tool call for 'search_ddg' immediately to verify.]"
         
-    weather_triggers = ["weather", "temperature", "forecast", "wind", "speed", "conditions"]
+    # Combines "wind speed" to ensure isolated commands like "speed up" don't trigger the weather interceptor
+    weather_triggers = ["weather", "temperature", "forecast", "wind speed", "conditions"]
     if any(trigger in lower_input for trigger in weather_triggers):
-        return f"{user_input}\n\n[SYSTEM HINT: You MUST use the get_weather tool to find the current conditions.]"
+        return f"{user_input}\n\n[ACTION REQUIRED: Generate a JSON tool call for 'get_weather' immediately. Output ONLY the tool call.]"
 
     # URL and Web Scraping Interceptor
     url_triggers = ["http://", "https://", "www.", "scrape", "fetch", "summarize site"]
     if any(trigger in lower_input for trigger in url_triggers):
-        return f"{user_input}\n\n[SYSTEM HINT: DO NOT state that you cannot browse the internet. You possess tools for this. You MUST execute the `fetch_url_content` or `scrape_and_summarize_url` tool to process the requested web page.]"
+        return f"{user_input}\n\n[ACTION REQUIRED: Generate a JSON tool call for 'fetch_url_content' or 'scrape_and_summarize_url'.]"
 
     # Time and Date Check
     time_triggers = ["what time", "current time", "date is it", "todays date", "what day"]
     if any(trigger in lower_input for trigger in time_triggers):
-        return f"{user_input}\n\n[SYSTEM HINT: You MUST use the get_system_time tool to check the host clock.]"
+        return f"{user_input}\n\n[ACTION REQUIRED: Generate a JSON tool call for 'get_system_time' immediately.]"
 
-    # 2. Universal Interrogative (5 Ws + H) Trigger
+    # 3. Universal Interrogative (5 Ws + H) Trigger
     question_words = {"who", "what", "where", "when", "why", "how"}
     conversational_exceptions = {"up", "are", "you", "going", "doing", "is", "your", "name", "old", "much"}
     
     if words and words[0] in question_words:
         remaining_words = set(words[1:])
         if not remaining_words.issubset(conversational_exceptions):
-            return f"{user_input}\n\n[SYSTEM HINT: DO NOT answer from memory. DO NOT APOLOGIZE. You MUST immediately execute the search_ddg or search_wikipedia tool to find out.]"
+            return f"{user_input}\n\n[ACTION REQUIRED: Generate a JSON tool call for 'search_ddg' or 'search_wikipedia' immediately. DO NOT answer from memory.]"
 
-    # 3. Looser Semantic Threshold Fallback
+    # 4. Looser Semantic Threshold Fallback
     if not (emb := config.get_ollama_embedding(user_input)) or config.few_shot_collection.count() == 0: 
         return user_input
         
     res = config.few_shot_collection.query(query_embeddings=[emb], n_results=1)
     if res['documents'][0] and (res['distances'][0][0] if res['distances'] else 1.0) < 0.85:
-        return f"{user_input}\n\n[CRITICAL HINT: {res['documents'][0][0]}]"
+        return f"{user_input}\n\n[ACTION REQUIRED: {res['documents'][0][0]}]"
         
     return user_input

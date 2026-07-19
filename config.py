@@ -5,8 +5,10 @@ import chromadb
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 OLLAMA_CTX = int(os.getenv("OLLAMA_CONTEXT_LENGTH", "8192"))
-MODEL_NAME = "qwen2.5-coder:3b"
-SUB_MODEL_NAME = "qwen2.5-coder:0.5b"
+
+# Switched to Phi-4-mini for superior reasoning and native tool support
+MODEL_NAME = "qwen2.5-coder-agent:latest"
+SUB_MODEL_NAME = "qwen2.5:0.5b"
 VISION_MODEL_NAME = "moondream:1.8b-v2-q4_K_M"
 
 MEMORY_DIR = os.getenv("MEMORY_DIR", "/app/memory")
